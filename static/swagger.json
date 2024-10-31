@@ -1,0 +1,54 @@
+{
+    "swagger": "2.0",
+    "info": {
+      "version": "1.0.0",
+      "title": "ContextualChat-AI API",
+      "description": "API de chat con inteligencia artificial y RAG."
+    },
+    "paths": {
+      "/chat": {
+        "post": {
+          "summary": "Enviar consulta al chat",
+          "parameters": [
+            {
+              "name": "body",
+              "in": "body",
+              "required": true,
+              "schema": {
+                "$ref": "#/definitions/ChatRequest"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Respuesta del chat",
+              "schema": {
+                "$ref": "#/definitions/ChatResponse"
+              }
+            }
+          }
+        }
+      }
+    },
+    "definitions": {
+      "ChatRequest": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "example": "¿Qué puedes hacer?"
+          }
+        }
+      },
+      "ChatResponse": {
+        "type": "object",
+        "properties": {
+          "response": {
+            "type": "string",
+            "example": "Hola, estoy listo para responder tus preguntas."
+          }
+        }
+      }
+    }
+  }
+  
