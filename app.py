@@ -4,6 +4,7 @@ from langchain_community.document_loaders import DirectoryLoader
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import faiss
+import torch
 import os
 
 app = Flask(__name__)
@@ -21,80 +22,114 @@ swaggerui_blueprint = get_swaggerui_blueprint(
 
 app.register_blueprint(swaggerui_blueprint, url_prefix=SWAGGER_URL)
 
-# Carga el modelo de embeddings de Sentence Transformers
-model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+# Carga el modelo de embeddings de Sentence Transformers (ligero)
+embedding_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
 
 # Inicializa el índice FAISS para almacenar los embeddings
 dimension = 384  # Dimensión de los embeddings
 index = faiss.IndexFlatL2(dimension)
 
-# Carga el modelo y tokenizador de GPT-2
-gpt2_model_name = 'gpt2'
-tokenizer = AutoTokenizer.from_pretrained(gpt2_model_name)
-gpt2_model = AutoModelForCausalLM.from_pretrained(gpt2_model_name)
+# Carga el modelo y tokenizador de DistilGPT-2 (modelo generativo ligero)
+gpt_model_name = 'distilgpt2'
+tokenizer = AutoTokenizer.from_pretrained(gpt_model_name)
+tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})  # Agregar token de padding
+gpt_model = AutoModelForCausalLM.from_pretrained(gpt_model_name, output_hidden_states=True,  return_dict_in_generate=True)
+
+class ChatApi():
+    def __init__(self):
+        self.texts = []
+api = ChatApi()
 
 # Endpoint para cargar documentos
 @app.route('/upload_documents', methods=['POST'])
 def upload_documents():
     try:
-        loader = DirectoryLoader('./documents')  # Cambia la ruta según tu estructura
+        print(f"Buscando documentos en: {os.path.abspath('./documents')}")
+        
+        # Verifica que la carpeta de documentos exista
+        if not os.path.exists('./documents'):
+            return jsonify({"error": "El directorio './documents' no existe."}), 404
+        
+        print(f"Documentos disponibles: {os.listdir('./documents')}")  # Muestra los documentos en el directorio
+
+        loader = DirectoryLoader('./documents')  # Ruta donde están los documentos
         documents = loader.load()
-        texts = [doc.page_content for doc in documents]
+        
+        # Verifica que se hayan cargado documentos
+        if not documents:
+            return jsonify({"error": "No se encontraron documentos."}), 404  # Manejo de caso sin documentos
+
+        api.texts = [doc.page_content for doc in documents]
+
+        print(f"Documentos cargados: {len(api.texts)}")
+        if api.texts:
+            print(f"Texto de ejemplo de documentos cargados: {api.texts[0][:100]}")
 
         # Vectorización de documentos
-        embeddings = model.encode(texts)
-        index.add(embeddings)  # Agrega los embeddings al índice FAISS
+        embeddings = embedding_model.encode(api.texts, convert_to_tensor=True).cpu()  # Asegúrate de que esté en tensor
+        print(f"Tamaños de los embeddings: {[embedding.shape for embedding in embeddings]}")
 
-        return jsonify({"message": f"Se cargaron {len(texts)} documentos y se añadieron al índice."})
+        # Verifica la dimensión de los embeddings
+        for embedding in embeddings:
+            print(f"Dimensión del embedding: {embedding.shape}")  # Imprime la forma de cada embedding
+
+        # Asegúrate de que la dimensión coincida
+        if embeddings.shape[1] != dimension:
+            return jsonify({"error": f"La dimensión de los embeddings ({embeddings.shape[1]}) no coincide con la dimensión del índice FAISS ({dimension})."}), 500
+
+        index.add(embeddings.numpy().astype('float32'))  # Agrega los embeddings al índice FAISS
+        
+        # Verificar el tamaño del índice FAISS después de agregar los embeddings
+        print(f"Cantidad de vectores en el índice FAISS: {index.ntotal}")
+        if index.ntotal == 0:
+            return jsonify({"error": "No se añadieron embeddings al índice FAISS."}), 500
+
+        return jsonify({"message": f"Se cargaron {len(api.texts)} documentos y se añadieron al índice."})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500    
+        print(f"Error al cargar documentos: {str(e)}")  # Imprime el error en la consola
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/')
 def home():
     return jsonify({"message": "API de chat con IA y RAG"})
 
+# Endpoint para chat con RAG
 @app.route('/chat', methods=['POST'])
 def chat():
-    data = request.get_json()
+    data = request.json
+    question = data.get('query')
+
+    if not question:
+        return jsonify({"error": "Invalid question provided"}), 400
+
+    # Genera el embedding de la pregunta
+    question_embedding = embedding_model.encode(question, convert_to_tensor=True)  # Utiliza SentenceTransformer para el embedding
+
+    # Asegúrate de que question_embedding sea 2D
+    question_embedding = question_embedding.reshape(1, -1)  # Cambia a la forma correcta
+
+    print(f"Forma del embedding de la pregunta: {question_embedding.shape}")
+
+    # Busca el embedding en el índice FAISS
+    distances, indices = index.search(question_embedding.numpy(), k=1)
+    if distances is None or indices is None:
+        return jsonify({"error": "Search faled"}), 500
     
-    # Validación de entrada
-    if not data or 'query' not in data:
-        return jsonify({"error": "Por favor, proporciona una consulta válida."}), 400
+    if indices[0][0] != -1:
+        document_index = indices[0][0]
+        response_text = api.texts[document_index]
+        return jsonify({"response": response_text})
+    
+    #return jsonify({"err0r": "No se encontró documento relevante"}), 400
 
-    user_question = data['query']  # Obtiene la pregunta del usuario
+    # Procesa las distancias e índices
+    response = {
+        "distances": distances.tolist(),
+        "indices": indices.tolist()
+    }
 
-    # Vectoriza la pregunta del usuario para buscar en el índice FAISS
-    user_embedding = model.encode([user_question])
+    return jsonify(response)
 
-    # Busca los k-nearest neighbors en el índice FAISS
-    K = 1  # Número de documentos a recuperar
-    distances, indices = index.search(user_embedding, K)
-
-    # Recupera el documento más relevante
-    if indices.size > 0:
-        relevant_doc_index = indices[0][0]  # Obtiene el índice del documento más relevante
-        
-        # Carga el contenido del documento correspondiente
-        try:
-            with open(f'./documents/document_{relevant_doc_index}.txt', 'r') as f:  # Cambia la forma en que accedes al documento según tu carga
-                relevant_text = f.read()
-        except FileNotFoundError:
-            relevant_text = "Lo siento, el documento relevante no fue encontrado."
-    else:
-        relevant_text = "Lo siento, no pude encontrar información relevante."
-
-    # Combina la pregunta del usuario con el texto relevante para el modelo
-    context = f"{relevant_text}\n\nPregunta: {user_question}\nRespuesta:"
-    inputs_id = tokenizer.encode(context, return_tensors='pt')
-
-    # Generación de respuesta usando GPT-2
-    output = gpt2_model.generate(inputs_id, max_length=100, num_return_sequences=1)
-    response = tokenizer.decode(output[0], skip_special_tokens=True)
-
-    # Ajuste de la respuesta para quitar la pregunta del texto
-    response = response.replace(context, '').strip()
-
-    return jsonify({"response": response})
 
 if __name__ == '__main__':
     app.run(debug=True)
